@@ -369,6 +369,15 @@ paths:
                 maxIterations:
                   type: integer
                   minimum: 1
+                  default: 10
+                paginationType:
+                  type: string
+                  enum: [link, bookmark]
+                  default: link
+                  description: |
+                    Type of pagination to use:
+                    - 'link' for APIs using Link headers (e.g. Shopify)
+                    - 'bookmark' for APIs using bookmark tokens (e.g. Pinterest)
                 queryParams:
                   type: object
                   additionalProperties: true
@@ -387,17 +396,76 @@ paths:
                 properties:
                   status:
                     type: integer
+                    description: HTTP status code
                   metadata:
                     type: object
                     properties:
-                      currentPage:
+                      totalPages:
                         type: integer
-                      isFirstIteration:
-                        type: boolean
+                        description: Total number of pages fetched
+                      totalItems:
+                        type: integer
+                        description: Total number of items fetched
                       executionId:
                         type: string
+                        description: Unique ID for this pagination execution
+                      paginationType:
+                        type: string
+                        enum: [link, bookmark]
+                        description: Type of pagination used
                   data:
+                    type: array
+                    description: Aggregated data from all pages
+                    items:
+                      type: object
+        "401":
+          description: Authentication failed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    example: "Authentication Failed"
+                  status:
+                    type: integer
+                    example: 401
+                  statusText:
+                    type: string
+                  details:
                     type: object
+        "403":
+          description: Authorization failed
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    example: "Authentication Failed"
+                  status:
+                    type: integer
+                    example: 403
+                  statusText:
+                    type: string
+                  details:
+                    type: object
+        "500":
+          description: Server error
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  error:
+                    type: string
+                    example: "Failed to execute paginated request"
+                  details:
+                    type: string
+                  code:
+                    type: string
 
 components:
   schemas:

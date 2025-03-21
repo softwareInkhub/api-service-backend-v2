@@ -734,3 +734,188 @@ curl -X POST http://localhost:5000/api/dynamodb/tables \
     "BillingMode": "PAY_PER_REQUEST"
   }'
 ```
+
+## Execution API Documentation
+
+This section describes the execution endpoints for making API requests and handling pagination.
+
+### Base URL
+```
+http://localhost:5000/api
+```
+
+### Execution Endpoints
+
+#### 1. Execute Single Request
+Executes a single API request.
+
+```http
+POST /execute
+```
+
+**Request Body**
+```json
+{
+  "method": "GET",
+  "url": "https://api.example.com/data",
+  "queryParams": {
+    "limit": "10"
+  },
+  "headers": {
+    "Authorization": "Bearer your-token"
+  },
+  "body": null  // Optional, for POST/PUT/PATCH requests
+}
+```
+
+**Response**
+```json
+{
+  "status": 200,
+  "body": {
+    // Response data from the API
+  }
+}
+```
+
+#### 2. Execute Paginated Request
+Executes a paginated API request that automatically handles different pagination types.
+
+```http
+POST /execute/paginated
+```
+
+**Request Body**
+```json
+{
+  "method": "GET",
+  "url": "https://api.example.com/data",
+  "maxIterations": 10,  // Optional, defaults to 10
+  "queryParams": {
+    "limit": "10"
+  },
+  "headers": {
+    "Authorization": "Bearer your-token"
+  },
+  "body": null  // Optional, for POST/PUT/PATCH requests
+}
+```
+
+**Response**
+```json
+{
+  "status": 200,
+  "metadata": {
+    "totalPages": 5,
+    "totalItems": 150,
+    "executionId": "unique-uuid",
+    "paginationType": "link"  // or "bookmark", "cursor", "offset", or "none"
+  },
+  "data": [
+    // Aggregated data from all pages
+  ]
+}
+```
+
+### Supported Pagination Types
+
+The paginated execution endpoint automatically detects and handles the following pagination types:
+
+1. **Link Header Pagination** (e.g., Shopify)
+   - Detects `Link` header with `rel="next"`
+   - Example: `Link: <https://api.example.com/data?page=2>; rel="next"`
+
+2. **Bookmark Pagination** (e.g., Pinterest)
+   - Detects `bookmark` field in response data
+   - Example: `{ "items": [...], "bookmark": "next_page_token" }`
+
+3. **Cursor Pagination**
+   - Detects `next_cursor` or `cursor` field in response data
+   - Example: `{ "items": [...], "next_cursor": "cursor_token" }`
+
+4. **Offset/Limit Pagination**
+   - Detects `total_count` or `total` field in response data
+   - Example: `{ "items": [...], "total_count": 100 }`
+
+### Example Usage
+
+#### 1. Shopify API (Link Header Pagination)
+```bash
+curl -X POST http://localhost:5000/api/execute/paginated \
+  -H "Content-Type: application/json" \
+  -d '{
+    "method": "GET",
+    "url": "https://your-store.myshopify.com/admin/api/2024-01/orders.json",
+    "headers": {
+      "X-Shopify-Access-Token": "your-access-token"
+    }
+  }'
+```
+
+#### 2. Pinterest API (Bookmark Pagination)
+```bash
+curl -X POST http://localhost:5000/api/execute/paginated \
+  -H "Content-Type: application/json" \
+  -d '{
+    "method": "GET",
+    "url": "https://api.pinterest.com/v5/pins",
+    "headers": {
+      "Authorization": "Bearer your-access-token"
+    }
+  }'
+```
+
+### Error Handling
+
+The execution endpoints handle various types of errors:
+
+1. **Authentication Errors** (401/403)
+```json
+{
+  "error": "Authentication Failed",
+  "status": 401,
+  "statusText": "Unauthorized",
+  "details": {
+    // API error details
+  }
+}
+```
+
+2. **API Errors** (4xx/5xx)
+```json
+{
+  "error": "API Request Failed",
+  "status": 400,
+  "statusText": "Bad Request",
+  "details": {
+    // API error details
+  }
+}
+```
+
+3. **Connection Errors**
+```json
+{
+  "error": "Connection Failed",
+  "details": "Could not connect to the server",
+  "code": "ECONNREFUSED"
+}
+```
+
+### Best Practices
+
+1. **Rate Limiting**
+   - Consider API rate limits when setting `maxIterations`
+   - Monitor response headers for rate limit information
+
+2. **Error Handling**
+   - Always check the response status and error details
+   - Implement retry logic for transient failures
+
+3. **Data Volume**
+   - Be mindful of memory usage with large datasets
+   - Consider implementing streaming for very large responses
+
+4. **Authentication**
+   - Store sensitive tokens securely
+   - Use environment variables for API keys

@@ -1149,7 +1149,7 @@ const mainApi = new OpenAPIBackend({
         maxIterations = 10,
         queryParams = {}, 
         headers = {}, 
-        body = null 
+        body = null
       } = c.request.requestBody;
 
       try {
@@ -1157,40 +1157,180 @@ const mainApi = new OpenAPIBackend({
         let currentUrl = url;
         const aggregatedData = [];
         let pageCount = 1;
+        let hasMorePages = true;
+        let detectedPaginationType = null;
 
-        // Extract next URL from Link header
+        // Function to detect pagination type from response
+        const detectPaginationType = (response) => {
+          // Check for Link header pagination (Shopify style)
+          if (response.headers.link && response.headers.link.includes('rel="next"')) {
+            return 'link';
+          }
+          
+          // Check for bookmark pagination (Pinterest style)
+          if (response.data && response.data.bookmark) {
+            return 'bookmark';
+          }
+
+          // Check for cursor-based pagination
+          if (response.data && (response.data.next_cursor || response.data.cursor)) {
+            return 'cursor';
+          }
+
+          // Check for offset/limit pagination
+          if (response.data && (response.data.total_count !== undefined || response.data.total !== undefined)) {
+            return 'offset';
+          }
+
+          return null;
+        };
+
+        // Extract next URL from Link header (Shopify)
         const extractNextUrl = (linkHeader) => {
           if (!linkHeader) return null;
           const matches = linkHeader.match(/<([^>]+)>;\s*rel="next"/);
           return matches ? matches[1] : null;
         };
 
-        // Build initial URL with query parameters
-        const urlObj = new URL(currentUrl);
-        Object.entries(queryParams).forEach(([key, value]) => {
-          if (value) urlObj.searchParams.append(key, value);
-        });
+        // Extract bookmark from response (Pinterest)
+        const extractBookmark = (responseData) => {
+          if (!responseData) return null;
+          return responseData.bookmark || null;
+        };
 
-        // Make first request
-        console.log('[Paginated] Making first request:', urlObj.toString());
-        const response = await axios({
-          method: method.toUpperCase(),
-          url: urlObj.toString(),
-          headers: headers,
-          data: !['GET', 'HEAD'].includes(method.toUpperCase()) ? body : undefined,
-          validateStatus: () => true
-        });
+        // Extract cursor from response
+        const extractCursor = (responseData) => {
+          if (!responseData) return null;
+          return responseData.next_cursor || responseData.cursor || null;
+        };
 
-        // Log metadata but return only data
-        console.log('[Paginated] First page metadata:', {
-          status: response.status,
-          hasNextPage: !!extractNextUrl(response.headers.link),
-          itemCount: response.data?.orders?.length || 0
-        });
+        while (hasMorePages && pageCount <= maxIterations) {
+          // Build URL with query parameters
+          const urlObj = new URL(currentUrl);
+          Object.entries(queryParams).forEach(([key, value]) => {
+            if (value) urlObj.searchParams.append(key, value);
+          });
+
+          // Make request
+          console.log(`[Paginated] Making request ${pageCount}:`, urlObj.toString());
+          const response = await axios({
+            method: method.toUpperCase(),
+            url: urlObj.toString(),
+            headers: headers,
+            data: !['GET', 'HEAD'].includes(method.toUpperCase()) ? body : undefined,
+            validateStatus: () => true
+          });
+
+          // Detect pagination type on first request if not specified
+          if (pageCount === 1) {
+            detectedPaginationType = detectPaginationType(response);
+            console.log(`[Paginated] Detected pagination type: ${detectedPaginationType}`);
+          }
+
+          // Handle authentication errors
+          if (response.status === 401 || response.status === 403) {
+            return {
+              statusCode: response.status,
+              body: {
+                error: 'Authentication Failed',
+                status: response.status,
+                statusText: response.statusText,
+                details: response.data
+              }
+            };
+          }
+
+          // Handle other errors
+          if (response.status >= 400) {
+            return {
+              statusCode: response.status,
+              body: {
+                error: 'API Request Failed',
+                status: response.status,
+                statusText: response.statusText,
+                details: response.data
+              }
+            };
+          }
+
+          // Add response data to aggregated results
+          if (response.data) {
+            // Handle different response structures
+            if (Array.isArray(response.data)) {
+              aggregatedData.push(...response.data);
+            } else if (response.data.data && Array.isArray(response.data.data)) {
+              aggregatedData.push(...response.data.data);
+            } else if (response.data.items && Array.isArray(response.data.items)) {
+              aggregatedData.push(...response.data.items);
+            } else {
+              aggregatedData.push(response.data);
+            }
+          }
+
+          // Check for next page based on detected pagination type
+          if (detectedPaginationType === 'link') {
+            const nextUrl = extractNextUrl(response.headers.link);
+            if (!nextUrl) {
+              hasMorePages = false;
+            } else {
+              currentUrl = nextUrl;
+            }
+          } else if (detectedPaginationType === 'bookmark') {
+            const bookmark = extractBookmark(response.data);
+            if (!bookmark) {
+              hasMorePages = false;
+            } else {
+              urlObj.searchParams.set('bookmark', bookmark);
+              currentUrl = urlObj.toString();
+            }
+          } else if (detectedPaginationType === 'cursor') {
+            const cursor = extractCursor(response.data);
+            if (!cursor) {
+              hasMorePages = false;
+            } else {
+              urlObj.searchParams.set('cursor', cursor);
+              currentUrl = urlObj.toString();
+            }
+          } else if (detectedPaginationType === 'offset') {
+            // For offset pagination, check if we've reached the total count
+            const totalCount = response.data.total_count || response.data.total;
+            const currentOffset = parseInt(urlObj.searchParams.get('offset') || '0');
+            const limit = parseInt(urlObj.searchParams.get('limit') || '10');
+            
+            if (currentOffset + limit >= totalCount) {
+              hasMorePages = false;
+            } else {
+              urlObj.searchParams.set('offset', (currentOffset + limit).toString());
+              currentUrl = urlObj.toString();
+            }
+          } else {
+            // If no pagination type detected, assume single page
+            hasMorePages = false;
+          }
+
+          console.log(`[Paginated] Page ${pageCount} complete:`, {
+            status: response.status,
+            hasMorePages,
+            itemCount: aggregatedData.length,
+            nextUrl: currentUrl,
+            paginationType: detectedPaginationType
+          });
+
+          pageCount++;
+        }
 
         return {
-          statusCode: response.status,
-          body: response.data
+          statusCode: 200,
+          body: {
+            status: 200,
+            metadata: {
+              totalPages: pageCount - 1,
+              totalItems: aggregatedData.length,
+              executionId,
+              paginationType: detectedPaginationType || 'none'
+            },
+            data: aggregatedData
+          }
         };
 
       } catch (error) {
@@ -1198,11 +1338,25 @@ const mainApi = new OpenAPIBackend({
           message: error.message,
           code: error.code
         });
+
+        // Handle specific error types
+        if (error.code === 'ECONNREFUSED') {
+          return {
+            statusCode: 500,
+            body: {
+              error: 'Connection Failed',
+              details: 'Could not connect to the server. The service might be down or the URL might be incorrect.',
+              code: error.code
+            }
+          };
+        }
+
         return {
           statusCode: 500,
           body: { 
-            error: 'Failed to execute request',
-            details: error.message
+            error: 'Failed to execute paginated request',
+            details: error.message,
+            code: error.code
           }
         };
       }
