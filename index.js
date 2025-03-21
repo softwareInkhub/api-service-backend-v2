@@ -22,38 +22,8 @@ app.use(cors());
 // File storage configuration
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
-const DATA_DIR = path.join(__dirname, 'data');
-const STORAGE_FILE = path.join(DATA_DIR, 'namespaces.json');
 
-// Ensure data directory exists
-if (!fs.existsSync(DATA_DIR)) {
-  fs.mkdirSync(DATA_DIR, { recursive: true });
-}
 
-// Load namespaces from storage or initialize empty array
-let namespaces = [];
-try {
-  if (fs.existsSync(STORAGE_FILE)) {
-    const data = fs.readFileSync(STORAGE_FILE, 'utf8');
-    namespaces = JSON.parse(data);
-  } else {
-    // Initialize empty storage file if it doesn't exist
-    fs.writeFileSync(STORAGE_FILE, JSON.stringify([], null, 2));
-  }
-  console.log(`[Storage] Loaded ${namespaces.length} namespaces`);
-} catch (error) {
-  console.error('[Storage] Error loading namespaces:', error);
-}
-
-// Function to save namespaces to storage
-const saveNamespaces = () => {
-  try {
-    fs.writeFileSync(STORAGE_FILE, JSON.stringify(namespaces, null, 2));
-    console.log(`[Storage] Saved ${namespaces.length} namespaces`);
-  } catch (error) {
-    console.error('[Storage] Error saving namespaces:', error);
-  }
-};
 
 app.get("/test",(req,res)=>{res.send("hello! world");
 })
@@ -316,6 +286,10 @@ const mainApi = new OpenAPIBackend({
                 key: header.M.key.S,
                 value: header.M.value.S
               })) || [],
+              'variables': data['variables']?.L?.map(variable => ({
+                key: variable.M.key.S,
+                value: variable.M.value.S
+              })) || [],
               'tags': data['tags']?.L?.map(tag => tag.S) || []
             };
           });
@@ -576,30 +550,48 @@ const mainApi = new OpenAPIBackend({
 
     updateNamespace: async (c, req, res) => {
       const namespaceId = c.request.params.namespaceId;
-      const updateExpression = {
-        UpdateExpression: "set #data = :value",
-        ExpressionAttributeNames: {
-          "#data": "data"
-        },
-        ExpressionAttributeValues: {
-          ":value": {
-            'namespace-id': namespaceId,
-            'namespace-name': c.request.requestBody['namespace-name'],
-            'namespace-url': c.request.requestBody['namespace-url'],
-            'tags': c.request.requestBody['tags'] || []
-          }
-        }
-      };
-
-      console.log('[updateNamespace] Request:', {
-        method: 'PUT',
-        url: `/tables/brmh-namespace/items/namespace#${namespaceId}`,
-        body: updateExpression,
-        params: { namespaceId }
-      });
-
+      
+      // First, get the existing namespace to ensure it exists
       try {
-        const response = await dynamodbHandlers.updateItem({
+        const getResponse = await dynamodbHandlers.getItemsByPk({
+          request: {
+            params: {
+              tableName: 'brmh-namespace',
+              id: namespaceId
+            }
+          }
+        });
+
+        if (!getResponse.body?.items?.[0]) {
+          return {
+            statusCode: 404,
+            body: { error: 'Namespace not found' }
+          };
+        }
+
+        const updateExpression = {
+          UpdateExpression: "SET #data = :value",
+          ExpressionAttributeNames: {
+            "#data": "data"
+          },
+          ExpressionAttributeValues: {
+            ":value": {
+              'namespace-id': namespaceId,
+              'namespace-name': c.request.requestBody['namespace-name'],
+              'namespace-url': c.request.requestBody['namespace-url'],
+              'tags': c.request.requestBody['tags'] || []
+            }
+          }
+        };
+
+        console.log('[updateNamespace] Request:', {
+          method: 'PUT',
+          url: `/tables/brmh-namespace/items/${namespaceId}`,
+          body: updateExpression,
+          params: { namespaceId }
+        });
+
+        const response = await dynamodbHandlers.updateItemsByPk({
           request: {
             params: {
               tableName: 'brmh-namespace',
@@ -623,13 +615,13 @@ const mainApi = new OpenAPIBackend({
 
         return {
           statusCode: 200,
-          body: response.body.data
+          body: updateExpression.ExpressionAttributeValues[":value"]
         };
       } catch (error) {
         console.error('[updateNamespace] Error:', error);
         return {
           statusCode: 500,
-          body: { error: 'Failed to update namespace' }
+          body: { error: 'Failed to update namespace', details: error.message }
         };
       }
     },
@@ -691,6 +683,7 @@ const mainApi = new OpenAPIBackend({
           'namespace-account-name': c.request.requestBody['namespace-account-name'],
           'namespace-account-url-override': c.request.requestBody['namespace-account-url-override'],
           'namespace-account-header': c.request.requestBody['namespace-account-header'] || [],
+          'variables': c.request.requestBody['variables'] || [],
           'tags': c.request.requestBody['tags'] || []
         }
       };
@@ -732,61 +725,51 @@ const mainApi = new OpenAPIBackend({
       const accountId = c.request.params.accountId;
       
       // First, get the existing account to preserve namespace-id
-      const getResponse = await dynamodbHandlers.getItems({
-        request: {
-          params: {
-            tableName: 'brmh-namespace-accounts'
-          },
-          requestBody: {
-            TableName: 'brmh-namespace-accounts',
-            FilterExpression: "id = :accountId",
-            ExpressionAttributeValues: {
-              ":accountId": accountId
+      try {
+        const getResponse = await dynamodbHandlers.getItemsByPk({
+          request: {
+            params: {
+              tableName: 'brmh-namespace-accounts',
+              id: accountId
             }
           }
+        });
+
+        if (!getResponse.body?.items?.[0]) {
+          return {
+            statusCode: 404,
+            body: { error: 'Account not found' }
+          };
         }
-      });
 
-      if (!getResponse.body?.items?.[0]) {
-        return {
-          statusCode: 404,
-          body: { error: 'Account not found' }
-        };
-      }
+        const existingAccount = getResponse.body.items[0];
+        const namespaceId = existingAccount.data['namespace-id'];
 
-      const existingAccount = getResponse.body.items[0];
-      const namespaceId = existingAccount.data['namespace-id'];
-
-      const updateExpression = {
-        TableName: 'brmh-namespace-accounts',
-        Key: {
-          id: accountId,
-          type: 'account'
-        },
-        UpdateExpression: "SET #data = :value",
-        ExpressionAttributeNames: {
-          "#data": "data"
-        },
-        ExpressionAttributeValues: {
-          ":value": {
-            'namespace-id': namespaceId,
-            'namespace-account-id': accountId,
-            'namespace-account-name': c.request.requestBody['namespace-account-name'],
-            'namespace-account-url-override': c.request.requestBody['namespace-account-url-override'],
-            'namespace-account-header': c.request.requestBody['namespace-account-header'] || [],
-            'tags': c.request.requestBody['tags'] || []
+        const updateExpression = {
+          UpdateExpression: "SET #data = :value",
+          ExpressionAttributeNames: {
+            "#data": "data"
+          },
+          ExpressionAttributeValues: {
+            ":value": {
+              'namespace-id': namespaceId,
+              'namespace-account-id': accountId,
+              'namespace-account-name': c.request.requestBody['namespace-account-name'],
+              'namespace-account-url-override': c.request.requestBody['namespace-account-url-override'],
+              'namespace-account-header': c.request.requestBody['namespace-account-header'] || [],
+              'variables': c.request.requestBody['variables'] || [],
+              'tags': c.request.requestBody['tags'] || []
+            }
           }
-        }
-      };
+        };
 
-      console.log('[updateNamespaceAccount] Request:', {
-        method: 'PUT',
-        url: `/tables/brmh-namespace-accounts/items/${accountId}`,
-        body: updateExpression
-      });
+        console.log('[updateNamespaceAccount] Request:', {
+          method: 'PUT',
+          url: `/tables/brmh-namespace-accounts/items/${accountId}`,
+          body: updateExpression
+        });
 
-      try {
-        const response = await dynamodbHandlers.updateItem({
+        const response = await dynamodbHandlers.updateItemsByPk({
           request: {
             params: {
               tableName: 'brmh-namespace-accounts',
@@ -923,43 +906,60 @@ const mainApi = new OpenAPIBackend({
 
     updateNamespaceMethod: async (c, req, res) => {
       const methodId = c.request.params.methodId;
-      const updateExpression = {
-        TableName: 'brmh-namespace-methods',
-        Key: {
-          id: methodId,
-          type: 'method'
-        },
-        UpdateExpression: "SET #data = :value",
-        ExpressionAttributeNames: {
-          "#data": "data"
-        },
-        ExpressionAttributeValues: {
-          ":value": {
-            'namespace-method-id': methodId,
-            'namespace-method-name': c.request.requestBody['namespace-method-name'],
-            'namespace-method-type': c.request.requestBody['namespace-method-type'],
-            'namespace-method-url-override': c.request.requestBody['namespace-method-url-override'],
-            'namespace-method-queryParams': c.request.requestBody['namespace-method-queryParams'] || [],
-            'namespace-method-header': c.request.requestBody['namespace-method-header'] || [],
-            'save-data': c.request.requestBody['save-data'] !== undefined ? c.request.requestBody['save-data'] : false,
-            'isInitialized': c.request.requestBody['isInitialized'] !== undefined ? c.request.requestBody['isInitialized'] : false,
-            'tags': c.request.requestBody['tags'] || [],
-            'sample-request': c.request.requestBody['sample-request'],
-            'sample-response': c.request.requestBody['sample-response'],
-            'request-schema': c.request.requestBody['request-schema'],
-            'response-schema': c.request.requestBody['response-schema']
-          }
-        }
-      };
-
-      console.log('[updateNamespaceMethod] Request:', {
-        method: 'PUT',
-        url: `/tables/brmh-namespace-methods/items/${methodId}`,
-        body: updateExpression
-      });
-
+      
+      // First, get the existing method to preserve namespace-id
       try {
-        const response = await dynamodbHandlers.updateItem({
+        const getResponse = await dynamodbHandlers.getItemsByPk({
+          request: {
+            params: {
+              tableName: 'brmh-namespace-methods',
+              id: methodId
+            }
+          }
+        });
+
+        if (!getResponse.body?.items?.[0]) {
+          return {
+            statusCode: 404,
+            body: { error: 'Method not found' }
+          };
+        }
+
+        const existingMethod = getResponse.body.items[0];
+        const namespaceId = existingMethod.data['namespace-id'];
+
+        const updateExpression = {
+          UpdateExpression: "SET #data = :value",
+          ExpressionAttributeNames: {
+            "#data": "data"
+          },
+          ExpressionAttributeValues: {
+            ":value": {
+              'namespace-id': namespaceId,
+              'namespace-method-id': methodId,
+              'namespace-method-name': c.request.requestBody['namespace-method-name'],
+              'namespace-method-type': c.request.requestBody['namespace-method-type'],
+              'namespace-method-url-override': c.request.requestBody['namespace-method-url-override'],
+              'namespace-method-queryParams': c.request.requestBody['namespace-method-queryParams'] || [],
+              'namespace-method-header': c.request.requestBody['namespace-method-header'] || [],
+              'save-data': c.request.requestBody['save-data'] !== undefined ? c.request.requestBody['save-data'] : false,
+              'isInitialized': c.request.requestBody['isInitialized'] !== undefined ? c.request.requestBody['isInitialized'] : false,
+              'tags': c.request.requestBody['tags'] || [],
+              'sample-request': c.request.requestBody['sample-request'],
+              'sample-response': c.request.requestBody['sample-response'],
+              'request-schema': c.request.requestBody['request-schema'],
+              'response-schema': c.request.requestBody['response-schema']
+            }
+          }
+        };
+
+        console.log('[updateNamespaceMethod] Request:', {
+          method: 'PUT',
+          url: `/tables/brmh-namespace-methods/items/${methodId}`,
+          body: updateExpression
+        });
+
+        const response = await dynamodbHandlers.updateItemsByPk({
           request: {
             params: {
               tableName: 'brmh-namespace-methods',
@@ -974,22 +974,15 @@ const mainApi = new OpenAPIBackend({
           body: response.body
         });
 
-        if (response.statusCode === 404) {
-          return {
-            statusCode: 404,
-            body: { error: 'Method not found' }
-          };
-        }
-
         return {
           statusCode: 200,
-          body: response.body
+          body: updateExpression.ExpressionAttributeValues[":value"]
         };
       } catch (error) {
         console.error('[updateNamespaceMethod] Error:', error);
         return {
           statusCode: 500,
-          body: { error: 'Failed to update namespace method' }
+          body: { error: 'Failed to update namespace method', details: error.message }
         };
       }
     },
@@ -1040,67 +1033,13 @@ const mainApi = new OpenAPIBackend({
     // Execute request handlers
     executeNamespaceRequest: async (c, req, res) => {
       console.log('Executing request with params:', {
-        namespaceId: c.request.params.namespaceId,
         method: c.request.requestBody.method,
-        url: c.request.requestBody.url,
-        accountId: c.request.requestBody.namespaceAccountId
+        url: c.request.requestBody.url
       });
 
-      const namespaceIndex = namespaces.findIndex(n => n['namespace-id'] === c.request.params.namespaceId);
-      if (namespaceIndex === -1) {
-        console.log('Namespace not found:', c.request.params.namespaceId);
-        return {
-          statusCode: 404,
-          body: { error: 'Namespace not found' }
-        };
-      }
-
-      const { method, url, namespaceAccountId, queryParams = {}, headers = {}, body = null } = c.request.requestBody;
+      const { method, url, queryParams = {}, headers = {}, body = null } = c.request.requestBody;
       
-      // Find the account to get its headers
-      const account = namespaces[namespaceIndex]['namespace-accounts'].find(
-        a => a['namespace-account-id'] === namespaceAccountId
-      );
-      if (!account) {
-        console.log('Account not found:', namespaceAccountId);
-        return {
-          statusCode: 404,
-          body: { error: 'Account not found' }
-        };
-      }
-
       try {
-        // Get stored headers from account and validate them
-        const storedHeaders = account['namespace-account-header'] || [];
-        const accountHeaders = {};
-        storedHeaders.forEach(header => {
-          if (header.key && header.value && header.key.trim() !== '' && header.value.trim() !== '') {
-            accountHeaders[header.key.trim()] = header.value.trim();
-          }
-        });
-
-        // Validate and combine request headers
-        const requestHeaders = {};
-        Object.entries(headers).forEach(([key, value]) => {
-          if (key && value && key.trim() !== '' && value.trim() !== '') {
-            requestHeaders[key.trim()] = value.trim();
-          }
-        });
-
-        // Combine headers with proper validation
-        const combinedHeaders = {
-          'Accept': 'application/json',
-          ...accountHeaders,
-          ...requestHeaders
-        };
-
-        // Log headers for debugging (mask sensitive values)
-        const debugHeaders = { ...combinedHeaders };
-        ['Authorization', 'X-Shopify-Access-Token', 'api-key', 'token'].forEach(key => {
-          if (debugHeaders[key]) debugHeaders[key] = '****';
-        });
-        console.log('Making request with headers:', debugHeaders);
-
         // Build URL with query parameters
         const urlObj = new URL(url);
         Object.entries(queryParams).forEach(([key, value]) => {
@@ -1115,7 +1054,7 @@ const mainApi = new OpenAPIBackend({
         const response = await axios({
           method: method.toUpperCase(),
           url: urlObj.toString(),
-          headers: combinedHeaders,
+          headers: headers,
           data: body,
           validateStatus: () => true // Don't throw on any status
         });
@@ -1197,70 +1136,27 @@ const mainApi = new OpenAPIBackend({
       }
     },
 
-    executeNamespacePaginatedRequest: async (c, req, res) => {
-      console.log('[Paginated] Starting paginated request');
-      const namespaceIndex = namespaces.findIndex(n => n['namespace-id'] === c.request.params.namespaceId);
-      if (namespaceIndex === -1) {
-        return {
-          statusCode: 404,
-          body: { error: 'Namespace not found' }
-        };
-      }
+     executeNamespacePaginatedRequest: async (c, req, res) => {
+      console.log('[Paginated] Starting request:', {
+        method: c.request.requestBody.method,
+        url: c.request.requestBody.url,
+        maxIterations: c.request.requestBody.maxIterations || 10
+      });
 
       const { 
         method, 
         url, 
-        namespaceAccountId, 
         maxIterations = 10,
         queryParams = {}, 
         headers = {}, 
         body = null 
       } = c.request.requestBody;
 
-      console.log('[Config] Max iterations:', maxIterations);
-
-      // Find the account to get its headers
-      const account = namespaces[namespaceIndex]['namespace-accounts'].find(
-        a => a['namespace-account-id'] === namespaceAccountId
-      );
-      if (!account) {
-        return {
-          statusCode: 404,
-          body: { error: 'Account not found' }
-        };
-      }
-
       try {
-        // Get stored headers from account and validate them
-        const storedHeaders = account['namespace-account-header'] || [];
-        const accountHeaders = {};
-        storedHeaders.forEach(header => {
-          if (header.key && header.value && header.key.trim() !== '' && header.value.trim() !== '') {
-            accountHeaders[header.key.trim()] = header.value.trim();
-          }
-        });
-
-        // Validate and combine request headers
-        const requestHeaders = {};
-        Object.entries(headers).forEach(([key, value]) => {
-          if (key && value && key.trim() !== '' && value.trim() !== '') {
-            requestHeaders[key.trim()] = value.trim();
-          }
-        });
-
-        // Combine headers with proper validation
-        const combinedHeaders = {
-          'Accept': 'application/json',
-          'Content-Type': 'application/json',
-          ...accountHeaders,
-          ...requestHeaders
-        };
-
         const executionId = uuidv4();
         let currentUrl = url;
         const aggregatedData = [];
         let pageCount = 1;
-        let hasMorePages = false;
 
         // Extract next URL from Link header
         const extractNextUrl = (linkHeader) => {
@@ -1276,173 +1172,37 @@ const mainApi = new OpenAPIBackend({
         });
 
         // Make first request
-        console.log('[API] Making first request:', urlObj.toString());
+        console.log('[Paginated] Making first request:', urlObj.toString());
         const response = await axios({
           method: method.toUpperCase(),
           url: urlObj.toString(),
-          headers: combinedHeaders,
+          headers: headers,
           data: !['GET', 'HEAD'].includes(method.toUpperCase()) ? body : undefined,
           validateStatus: () => true
         });
 
-        console.log('[API] Response status:', response.status);
-        console.log('[API] Link header:', response.headers.link);
+        // Log metadata but return only data
+        console.log('[Paginated] First page metadata:', {
+          status: response.status,
+          hasNextPage: !!extractNextUrl(response.headers.link),
+          itemCount: response.data?.orders?.length || 0
+        });
 
-        // Handle errors first
-        if (response.status >= 400) {
-          console.error('[Error] API request failed:', {
-            status: response.status,
-            data: response.data
-          });
-          return {
-            statusCode: response.status,
-            body: {
-              error: 'API request failed',
-              details: response.data,
-              status: response.status,
-              metadata: {
-                currentPage: pageCount,
-                isFirstIteration: true,
-                executionId: executionId,
-                hasMorePages: false,
-                maxIterations: maxIterations
-              }
-            }
-          };
-        }
-
-        // Process first page data
-        console.log('[API] First page order IDs:', response.data.orders ? response.data.orders.map(order => order.id) : []);
-        
-        if (response.data) {
-          if (Array.isArray(response.data)) {
-            aggregatedData.push(...response.data);
-          } else if (response.data.data && Array.isArray(response.data.data)) {
-            aggregatedData.push(...response.data.data);
-          } else if (response.data.orders && Array.isArray(response.data.orders)) {
-            aggregatedData.push(...response.data.orders);
-          } else {
-            aggregatedData.push(response.data);
-          }
-        }
-
-        console.log('[API] Total orders after first page:', aggregatedData.length);
-
-        // Check for next page
-        currentUrl = extractNextUrl(response.headers.link);
-        hasMorePages = !!currentUrl;
-
-        // Prepare first response with aggregated data
-        const firstResponse = {
-          statusCode: 200,
-          body: {
-            status: response.status,
-            metadata: {
-              currentPage: pageCount,
-              isFirstIteration: true,
-              executionId: executionId,
-              hasMorePages: hasMorePages,
-              maxIterations: maxIterations,
-              totalPages: pageCount,
-              totalItems: aggregatedData.length
-            },
-            data: {
-              orders: response.data.orders || []
-            }
-          }
+        return {
+          statusCode: response.status,
+          body: response.data
         };
 
-        console.log('[API] First response metadata:', firstResponse.body.metadata);
-
-        // Start background processing if there are more pages
-        if (hasMorePages && maxIterations > 1) {
-          console.log('[Background] Starting background processing');
-          process.nextTick(async () => {
-            try {
-              while (currentUrl && pageCount < maxIterations) {
-                pageCount++;
-                console.log(`[Page ${pageCount}/${maxIterations}] Processing in background`);
-
-                const nextResponse = await axios({
-                  method: method.toUpperCase(),
-                  url: currentUrl,
-                  headers: combinedHeaders,
-                  data: !['GET', 'HEAD'].includes(method.toUpperCase()) ? body : undefined,
-                  validateStatus: () => true
-                });
-
-                console.log(`[Page ${pageCount}] Order IDs:`, nextResponse.data.orders ? nextResponse.data.orders.map(order => order.id) : []);
-
-                if (nextResponse.status >= 400) {
-                  console.error(`[Error] Failed to fetch page ${pageCount}:`, {
-                    status: nextResponse.status,
-                    error: nextResponse.data.error || 'Unknown error'
-                  });
-                  break;
-                }
-
-                if (nextResponse.data) {
-                  if (Array.isArray(nextResponse.data)) {
-                    aggregatedData.push(...nextResponse.data);
-                  } else if (nextResponse.data.data && Array.isArray(nextResponse.data.data)) {
-                    aggregatedData.push(...nextResponse.data.data);
-                  } else if (nextResponse.data.orders && Array.isArray(nextResponse.data.orders)) {
-                    aggregatedData.push(...nextResponse.data.orders);
-                  } else {
-                    aggregatedData.push(nextResponse.data);
-                  }
-                }
-
-                console.log(`[Page ${pageCount}] Total orders:`, aggregatedData.length);
-
-                // Get next URL for pagination
-                currentUrl = extractNextUrl(nextResponse.headers.link);
-                hasMorePages = !!currentUrl;
-
-                console.log(`[Page ${pageCount}] Has more pages:`, hasMorePages);
-
-                if (!hasMorePages || pageCount >= maxIterations) {
-                  console.log('[Complete] Reached end of pagination or max iterations');
-                  break;
-                }
-              }
-              console.log(`[Complete] Background processing finished:`, {
-                totalPages: pageCount,
-                totalOrders: aggregatedData.length,
-                maxIterations: maxIterations,
-                hasMorePages: hasMorePages
-              });
-            } catch (error) {
-              console.error('[Background Error]', error.message);
-            }
-          });
-        } else {
-          console.log('[Complete] No more pages to process or maxIterations is 1');
-        }
-
-        return firstResponse;
-
       } catch (error) {
-        console.error('[Error] Paginated request failed:', error);
+        console.error('[Paginated] Request failed:', {
+          message: error.message,
+          code: error.code
+        });
         return {
           statusCode: 500,
           body: { 
-            error: 'Failed to execute paginated request',
-            details: error.message,
-            metadata: {
-              currentPage: 1,
-              isFirstIteration: true,
-              executionId: uuidv4(),
-              hasMorePages: false,
-              maxIterations: maxIterations
-            },
-            suggestions: [
-              'Verify the URL is correct and accessible',
-              'Check if all required headers are properly formatted',
-              'Verify the HTTP method is supported',
-              'Ensure the request body is properly formatted (if applicable)',
-              'Check your network connection'
-            ]
+            error: 'Failed to execute request',
+            details: error.message
           }
         };
       }
@@ -1702,6 +1462,27 @@ app.get('/namespaces/:namespaceId', async (req, res) => {
   } catch (error) {
     console.error('Get namespace by ID error:', error);
     res.status(500).json({ error: 'Failed to get namespace' });
+  }
+});
+
+// Add PUT route for updating namespace
+app.put('/namespaces/:namespaceId', async (req, res) => {
+  try {
+    const response = await mainApi.handleRequest(
+      {
+        method: 'PUT',
+        path: `/namespaces/${req.params.namespaceId}`,
+        body: req.body,
+        params: req.params,
+        headers: req.headers
+      },
+      req,
+      res
+    );
+    res.status(response.statusCode).json(response.body);
+  } catch (error) {
+    console.error('Update namespace error:', error);
+    res.status(500).json({ error: 'Failed to update namespace' });
   }
 });
 
@@ -2013,6 +1794,46 @@ app.delete('/methods/:methodId', async (req, res) => {
   } catch (error) {
     console.error('Delete method error:', error);
     res.status(500).json({ error: 'Failed to delete method' });
+  }
+});
+
+// Add direct route for paginated execution
+app.post('/execute/paginated', async (req, res) => {
+  try {
+    const response = await mainApi.handleRequest(
+      {
+        method: 'POST',
+        path: '/execute/paginated',
+        body: req.body,
+        headers: req.headers
+      },
+      req,
+      res
+    );
+    res.status(response.statusCode).json(response.body);
+  } catch (error) {
+    console.error('Paginated execution error:', error);
+    res.status(500).json({ error: 'Failed to execute paginated request' });
+  }
+});
+
+// Add direct route for execute
+app.post('/execute', async (req, res) => {
+  try {
+    const response = await mainApi.handleRequest(
+      {
+        method: 'POST',
+        path: '/execute',
+        body: req.body,
+        headers: req.headers
+      },
+      req,
+      res
+    );
+    res.status(response.statusCode).json(response.body);
+  } catch (error) {
+    console.error('Execute request error:', error);
+    res.status(500).json({ error: 'Failed to execute request' });
   }
 });
 
