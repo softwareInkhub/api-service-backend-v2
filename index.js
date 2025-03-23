@@ -17,8 +17,11 @@ dotenv.config();
 
 const app = express();
 app.use(express.json());
-app.use(cors());
-
+app.use(cors({
+  origin: 'http://localhost:3000',
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Accept']
+}));
 // File storage configuration
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -1160,7 +1163,7 @@ const mainApi = new OpenAPIBackend({
 
       try {
         const executionId = uuidv4();
-        const aggregatedData = [];
+        const pages = []; // Array to store page data
         let pageCount = 1;
         let hasMorePages = true;
         let detectedPaginationType = null;
@@ -1302,8 +1305,14 @@ const mainApi = new OpenAPIBackend({
             responseData: response.data
           });
 
-          // Add response data to aggregated results
-          aggregatedData.push(...currentPageItems);
+          // Store page data
+          const pageData = {
+            items: currentPageItems,
+            data: response.data, // Keep the original response data for reference
+            url: urlObj.toString(),
+            headers: response.headers
+          };
+          pages.push(pageData);
           totalItemsProcessed += currentPageItems.length;
 
           // Check for next page based on detected pagination type
@@ -1384,7 +1393,7 @@ const mainApi = new OpenAPIBackend({
           executionId,
           paginationType: detectedPaginationType || 'none',
           finalUrl: currentUrl,
-          lastError: lastError // Include any errors that occurred
+          lastError: lastError
         });
 
         return {
@@ -1396,9 +1405,9 @@ const mainApi = new OpenAPIBackend({
               totalItems: totalItemsProcessed,
               executionId,
               paginationType: detectedPaginationType || 'none',
-              lastError: lastError // Include any errors in the response
+              lastError: lastError
             },
-            data: aggregatedData
+            pages: pages // Now returns array of page objects
           }
         };
 
