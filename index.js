@@ -12,6 +12,8 @@ import axios from 'axios';
 import { handlers as pinterestHandlers } from './pinterest-handlers.js';
 import { handlers as dynamodbHandlers } from './lib/dynamodb-handlers.js';
 import dotenv from 'dotenv';
+import { handlers as yamlHandlers } from './yaml-handlers.js';
+import { handlers as awsMessagingHandlers } from './aws-messaging-handlers.js';
 
 dotenv.config();  
 
@@ -1500,11 +1502,58 @@ const pinterestApi = new OpenAPIBackend({
   }
 });
 
+// Initialize YAML OpenAPI backend
+const yamlApi = new OpenAPIBackend({
+  definition: './yaml-service.yaml',
+  quick: true,
+  handlers: {
+    validationFail: async (c, req, res) => ({
+      statusCode: 400,
+      error: c.validation.errors
+    }),
+    notFound: async (c, req, res) => ({
+      statusCode: 404,
+      error: 'Not Found'
+    }),
+    generateOpenApiSpec: yamlHandlers.generateOpenApiSpec
+  }
+});
+
+// Initialize AWS Messaging OpenAPI backend
+const awsMessagingApi = new OpenAPIBackend({
+  definition: './aws-messaging.yaml',
+  quick: true,
+  handlers: {
+    validationFail: async (c, req, res) => ({
+      statusCode: 400,
+      error: c.validation.errors
+    }),
+    notFound: async (c, req, res) => ({
+      statusCode: 404,
+      error: 'Not Found'
+    }),
+    // SNS Handlers
+    listSnsTopics: awsMessagingHandlers.listSnsTopics,
+    createSnsTopic: awsMessagingHandlers.createSnsTopic,
+    deleteSnsTopic: awsMessagingHandlers.deleteSnsTopic,
+    publishToSnsTopic: awsMessagingHandlers.publishToSnsTopic,
+    // SQS Handlers
+    listSqsQueues: awsMessagingHandlers.listSqsQueues,
+    createSqsQueue: awsMessagingHandlers.createSqsQueue,
+    deleteSqsQueue: awsMessagingHandlers.deleteSqsQueue,
+    sendMessage: awsMessagingHandlers.sendMessage,
+    receiveMessages: awsMessagingHandlers.receiveMessages,
+    deleteMessage: awsMessagingHandlers.deleteMessage
+  }
+});
+
 // Initialize all APIs
 await Promise.all([
   mainApi.init(),
   awsApi.init(),
-  pinterestApi.init()
+  pinterestApi.init(),
+  yamlApi.init(),
+  awsMessagingApi.init()
 ]);
 
 // Helper function to handle requests
@@ -1591,6 +1640,77 @@ app.get('/pinterest-api-docs', (req, res) => {
       swaggerUrl: "/pinterest-api-docs/swagger.json"
     })
   );
+});
+
+// Load YAML service OpenAPI specification
+const yamlOpenapiSpec = yaml.load(fs.readFileSync(path.join(__dirname, 'yaml-service.yaml'), 'utf8'));
+
+// Serve YAML service API docs
+app.use('/yaml-service-docs', swaggerUi.serve);
+app.get('/yaml-service-docs', (req, res) => {
+  res.send(
+    swaggerUi.generateHTML(yamlOpenapiSpec, {
+      customSiteTitle: "YAML Service API Documentation",
+      customfavIcon: "/favicon.ico",
+      customCss: '.swagger-ui .topbar { display: none }',
+      swaggerUrl: "/yaml-service-docs/swagger.json"
+    })
+  );
+});
+
+// Serve YAML service OpenAPI specification
+app.get('/yaml-service-docs/swagger.json', (req, res) => {
+  res.json(yamlOpenapiSpec);
+});
+
+// Handle YAML service routes
+app.all('/api/yaml/*', async (req, res) => {
+  try {
+    // Remove the /api/yaml prefix from the path
+    const adjustedPath = req.path.replace('/api/yaml', '');
+    
+    const response = await yamlApi.handleRequest(
+      {
+        method: req.method,
+        path: adjustedPath || '/',
+        body: req.body,
+        query: req.query,
+        headers: req.headers
+      },
+      req,
+      res
+    );
+    res.status(response.statusCode).json(response.body);
+  } catch (error) {
+    console.error('[YAML Service] Error:', error.message);
+    res.status(500).json({
+      error: 'Failed to handle YAML service request',
+      message: error.message
+    });
+  }
+});
+
+// Add direct route for generate
+app.post('/generate', async (req, res) => {
+  try {
+    const response = await yamlApi.handleRequest(
+      {
+        method: 'POST',
+        path: '/generate',
+        body: req.body,
+        headers: req.headers
+      },
+      req,
+      res
+    );
+    res.status(response.statusCode).json(response.body);
+  } catch (error) {
+    console.error('[Generate YAML] Error:', error.message);
+    res.status(500).json({
+      error: 'Failed to generate YAML',
+      message: error.message
+    });
+  }
 });
 
 // Handle AWS DynamoDB routes
@@ -2077,11 +2197,61 @@ app.post('/execute', async (req, res) => {
   }
 });
 
+// Load AWS Messaging OpenAPI specification
+const awsMessagingOpenapiSpec = yaml.load(fs.readFileSync(path.join(__dirname, 'aws-messaging.yaml'), 'utf8'));
+
+// Serve AWS Messaging API docs
+app.use('/aws-messaging-docs', swaggerUi.serve);
+app.get('/aws-messaging-docs', (req, res) => {
+  res.send(
+    swaggerUi.generateHTML(awsMessagingOpenapiSpec, {
+      customSiteTitle: "AWS Messaging Service Documentation",
+      customfavIcon: "/favicon.ico",
+      customCss: '.swagger-ui .topbar { display: none }',
+      swaggerUrl: "/aws-messaging-docs/swagger.json"
+    })
+  );
+});
+
+// Serve AWS Messaging OpenAPI specification
+app.get('/aws-messaging-docs/swagger.json', (req, res) => {
+  res.json(awsMessagingOpenapiSpec);
+});
+
+// Handle AWS Messaging routes
+app.all('/api/aws-messaging/*', async (req, res) => {
+  try {
+    // Remove the /api/aws-messaging prefix from the path
+    const adjustedPath = req.path.replace('/api/aws-messaging', '');
+    
+    const response = await awsMessagingApi.handleRequest(
+      {
+        method: req.method,
+        path: adjustedPath || '/',
+        body: req.body,
+        query: req.query,
+        headers: req.headers
+      },
+      req,
+      res
+    );
+    res.status(response.statusCode).json(response.body);
+  } catch (error) {
+    console.error('[AWS Messaging Service] Error:', error.message);
+    res.status(500).json({
+      error: 'Failed to handle AWS messaging service request',
+      message: error.message
+    });
+  }
+});
+
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Server listening on port ${PORT}`);
   console.log(`Main API documentation available at http://localhost:${PORT}/api-docs`);
   console.log(`Pinterest API documentation available at http://localhost:${PORT}/pinterest-api-docs`);
   console.log(`AWS DynamoDB service available at http://localhost:${PORT}/api/dynamodb`);
+  console.log(`YAML Service documentation available at http://localhost:${PORT}/yaml-service-docs`);
+  console.log(`AWS Messaging Service documentation available at http://localhost:${PORT}/aws-messaging-docs`);
 });
 
