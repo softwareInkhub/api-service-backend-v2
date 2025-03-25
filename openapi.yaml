@@ -467,6 +467,50 @@ paths:
                   code:
                     type: string
 
+  /api/dynamodb/tables/executions/items:
+    get:
+      summary: Get all executions
+      operationId: getExecutions
+      responses:
+        "200":
+          description: List of executions
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    exec-id:
+                      type: string
+                    child-exec-id:
+                      type: string
+                    data:
+                      type: object
+                      properties:
+                        execution-id:
+                          type: string
+                        iteration-no:
+                          type: number
+                        total-items-processed:
+                          type: number
+                        items-in-current-page:
+                          type: number
+                        request-url:
+                          type: string
+                        response-status:
+                          type: number
+                        pagination-type:
+                          type: string
+                        timestamp:
+                          type: string
+                        status:
+                          type: array
+                          items:
+                            type: string
+                        is-last:
+                          type: boolean
+
 components:
   schemas:
     NamespaceInput:

@@ -12,18 +12,13 @@ import axios from 'axios';
 import { handlers as pinterestHandlers } from './pinterest-handlers.js';
 import { handlers as dynamodbHandlers } from './lib/dynamodb-handlers.js';
 import dotenv from 'dotenv';
-import { handlers as yamlHandlers } from './yaml-handlers.js';
 import { handlers as awsMessagingHandlers } from './aws-messaging-handlers.js';
 
 dotenv.config();  
 
 const app = express();
 app.use(express.json());
-app.use(cors({
-  origin: 'http://localhost:3000',
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Accept']
-}));
+app.use(cors());
 // File storage configuration
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -478,6 +473,7 @@ const mainApi = new OpenAPIBackend({
       });
 
       try {
+        // First, create the namespace in DynamoDB
         const response = await dynamodbHandlers.createItem({
           request: {
             params: {
@@ -491,6 +487,72 @@ const mainApi = new OpenAPIBackend({
           statusCode: response.statusCode,
           body: response.body
         });
+
+        // Generate OpenAPI specification
+        console.log('[createNamespace] Generating OpenAPI specification');
+        const openApiSpec = {
+          openapi: '3.0.0',
+          info: {
+            title: `${item.data['namespace-name']} API`,
+            version: '1.0.0',
+            description: `API specification for ${item.data['namespace-name']} namespace`
+          },
+          servers: [
+            {
+              url: item.data['namespace-url'],
+              description: 'Base API URL'
+            }
+          ],
+          paths: {},
+          components: {
+            schemas: {},
+            securitySchemes: {}
+          },
+          tags: item.data.tags.map(tag => ({
+            name: tag,
+            description: `${tag} related operations`
+          }))
+        };
+
+        // Convert to YAML
+        console.log('[createNamespace] Converting OpenAPI spec to YAML');
+        const yamlSpec = yaml.dump(openApiSpec, {
+          indent: 2,
+          lineWidth: -1,
+          noRefs: true
+        });
+
+        // Save YAML to DynamoDB
+        console.log('[createNamespace] Saving YAML to DynamoDB');
+        const yamlId = uuidv4();
+        const yamlItem = {
+          id: yamlId,
+          type: 'yaml',
+          data: {
+            'yaml-id': yamlId,
+            'namespace-id': namespaceId,
+            'namespace-name': item.data['namespace-name'],
+            'yaml-content': yamlSpec,
+            'created-at': new Date().toISOString()
+          }
+        };
+
+        const yamlResponse = await dynamodbHandlers.createItem({
+          request: {
+            params: {
+              tableName: 'yaml'
+            },
+            requestBody: yamlItem
+          }
+        });
+
+        console.log('[createNamespace] YAML saved:', {
+          statusCode: yamlResponse.statusCode,
+          yamlId
+        });
+
+        // Add YAML ID to namespace data
+        item.data['yaml-id'] = yamlId;
 
         return {
           statusCode: 201,
@@ -1141,311 +1203,314 @@ const mainApi = new OpenAPIBackend({
       }
     },
 
-     executeNamespacePaginatedRequest: async (c, req, res) => {
-      console.log('\n=== PAGINATED REQUEST START ===');
-      console.log('Request details:', {
-        method: c.request.requestBody.method,
-        url: c.request.requestBody.url,
-        maxIterations: c.request.requestBody.maxIterations || 10,
-        queryParams: c.request.requestBody.queryParams,
-        headers: c.request.requestBody.headers
-      });
+    // Add this new function before executeNamespacePaginatedRequest
+    saveExecutionLog: async (executionId, pageData, pageCount, totalItemsProcessed, currentUrl, paginationType, isLastPage = false) => {
+      try {
+        const logId = uuidv4();
+        const timestamp = new Date().toISOString();
+        
+        // Determine if this is a parent log (pageCount === 0) or child log
+        const isParentLog = pageCount === 0;
+        
+        // Create the log item with properly formatted DynamoDB attributes
+        const requestBody = {
+          'exec-id': isParentLog ? executionId : executionId, // Parent log uses executionId as primary key
+          'child-exec-id': isParentLog ? executionId : logId, // Parent log uses same ID, child log uses unique UUID
+          type: 'execution_log',
+          data: {
+            'execution-id': executionId,
+            'iteration-no': pageCount, // 0 for parent, 1,2,3... for children
+            'total-items-processed': totalItemsProcessed,
+            'items-in-current-page': pageData?.items?.length || 0,
+            'request-url': currentUrl,
+            'response-status': pageData?.data?.status || 200,
+            'pagination-type': paginationType || 'none',
+            'timestamp': timestamp,
+            'status': isParentLog ? ['started'] : 
+                     isLastPage ? ['completed'] : 
+                     ['progress'],
+            'is-last': isLastPage
+          }
+        };
 
-      const { 
-        method, 
-        url, 
-        maxIterations = 10,
-        queryParams = {}, 
-        headers = {}, 
-        body = null
-      } = c.request.requestBody;
+        console.log('[saveExecutionLog] Saving log:', {
+          executionId,
+          logId,
+          pageCount,
+          isParentLog,
+          isLastPage,
+          itemsCount: pageData?.items?.length || 0,
+          requestBody
+        });
 
-      let currentUrl = url;
-      let lastError = null;
+        // Make the POST request to save the log
+        const response = await axios({
+          method: 'POST',
+          url: 'http://localhost:5000/api/dynamodb/tables/executions/items',
+          headers: {
+            'Content-Type': 'application/json'
+          },
+          data: requestBody
+        });
 
+        console.log('[saveExecutionLog] Response:', {
+          statusCode: response.status,
+          logId,
+          data: response.data
+        });
+
+        if (response.status === 201 || response.status === 200) {
+          return logId;
+        } else {
+          console.error('[saveExecutionLog] Failed to save log:', response.data);
+          return null;
+        }
+      } catch (error) {
+        console.error('[saveExecutionLog] Error:', error.response?.data || error.message);
+        return null;
+      }
+    },
+
+    executeNamespacePaginatedRequest: async (c, req, res) => {
       try {
         const executionId = uuidv4();
-        const pages = []; // Array to store page data
-        let pageCount = 1;
-        let hasMorePages = true;
-        let detectedPaginationType = null;
+        const timestamp = new Date().toISOString();
         let totalItemsProcessed = 0;
+        let currentPage = 1;
+        let nextUrl = c.request.requestBody.url;
+        let isLastPage = false;
+        let paginationType = 'none';
+        const maxIterations = c.request.requestBody.maxIterations || 10;
 
-        // Function to detect pagination type from response
-        const detectPaginationType = (response) => {
-          // Check for Link header pagination (Shopify style)
-          if (response.headers.link && response.headers.link.includes('rel="next"')) {
-            return 'link';
-          }
+        // Create initial execution log entry
+        await saveExecutionLog(executionId, null, 0, 0, nextUrl, 'none', false);
+
+        while (currentPage <= maxIterations && !isLastPage) {
+          console.log(`[executeNamespacePaginatedRequest] Processing page ${currentPage}`);
           
-          // Check for bookmark pagination (Pinterest style)
-          if (response.data && response.data.bookmark) {
-            return 'bookmark';
-          }
-
-          // Check for cursor-based pagination
-          if (response.data && (response.data.next_cursor || response.data.cursor)) {
-            return 'cursor';
-          }
-
-          // Check for offset/limit pagination
-          if (response.data && (response.data.total_count !== undefined || response.data.total !== undefined)) {
-            return 'offset';
-          }
-
-          return null;
-        };
-
-        // Extract next URL from Link header (Shopify)
-        const extractNextUrl = (linkHeader) => {
-          if (!linkHeader) return null;
-          const matches = linkHeader.match(/<([^>]+)>;\s*rel="next"/);
-          return matches ? matches[1] : null;
-        };
-
-        // Extract bookmark from response (Pinterest)
-        const extractBookmark = (responseData) => {
-          if (!responseData) return null;
-          return responseData.bookmark || null;
-        };
-
-        // Extract cursor from response
-        const extractCursor = (responseData) => {
-          if (!responseData) return null;
-          return responseData.next_cursor || responseData.cursor || null;
-        };
-
-        while (hasMorePages && pageCount <= maxIterations) {
-          console.log(`\n=== PAGE ${pageCount} START ===`);
-          
-          // Build URL with query parameters
-          const urlObj = new URL(currentUrl);
-          
-          // Only add query parameters if they're not already in the URL and it's the first page
-          if (pageCount === 1) {
-            Object.entries(queryParams).forEach(([key, value]) => {
-              if (value && !urlObj.searchParams.has(key)) {
-                urlObj.searchParams.append(key, value);
-              }
+          try {
+            const response = await axios({
+              method: c.request.requestBody.method,
+              url: nextUrl,
+              headers: c.request.requestBody.headers,
+              data: c.request.requestBody.body
             });
-          }
 
-          // Make request
-          console.log('Making request to:', urlObj.toString());
-          const response = await axios({
-            method: method.toUpperCase(),
-            url: urlObj.toString(),
-            headers: headers,
-            data: !['GET', 'HEAD'].includes(method.toUpperCase()) ? body : undefined,
-            validateStatus: () => true
-          });
-
-          console.log('Response received:', {
-            status: response.status,
-            statusText: response.statusText,
-            headers: response.headers,
-            dataLength: response.data ? JSON.stringify(response.data).length : 0,
-            data: response.data
-          });
-
-          // Handle API errors
-          if (response.status >= 400) {
-            lastError = {
-              status: response.status,
-              statusText: response.statusText,
-              data: response.data,
-              url: urlObj.toString()
-            };
-            console.error(`\nAPI Error on page ${pageCount}:`, lastError);
+            // Process the response
+            const pageData = response.data;
+            paginationType = detectPaginationType(response);
             
-            // For Shopify API, check if it's a rate limit error
-            if (response.status === 429 || 
-                (response.data && 
-                 response.data.errors && 
-                 (Array.isArray(response.data.errors) ? 
-                   response.data.errors.some(err => err.includes('rate limit')) :
-                   response.data.errors.toString().includes('rate limit')))) {
-              console.log('Rate limit detected, waiting before retry...');
-              await new Promise(resolve => setTimeout(resolve, 5000)); // Wait 5 seconds
-              continue; // Retry the same page
+            // Update total items processed
+            const itemsInCurrentPage = Array.isArray(pageData) ? pageData.length : 1;
+            totalItemsProcessed += itemsInCurrentPage;
+
+            // Save execution log for this page
+            await saveExecutionLog(
+              executionId,
+              { data: pageData, items: Array.isArray(pageData) ? pageData : [pageData] },
+              currentPage,
+              totalItemsProcessed,
+              nextUrl,
+              paginationType,
+              false
+            );
+
+            // Get next page URL based on pagination type
+            switch (paginationType) {
+              case 'link':
+                nextUrl = extractNextUrl(response.headers.link);
+                break;
+              case 'bookmark':
+                const bookmark = extractBookmark(pageData);
+                if (bookmark) {
+                  const url = new URL(nextUrl);
+                  url.searchParams.set('page_info', bookmark);
+                  nextUrl = url.toString();
+                }
+                break;
+              case 'cursor':
+                const cursor = extractCursor(pageData);
+                if (cursor) {
+                  const url = new URL(nextUrl);
+                  url.searchParams.set('cursor', cursor);
+                  nextUrl = url.toString();
+                }
+                break;
+              default:
+                nextUrl = null;
             }
+
+            // Check if this is the last page
+            isLastPage = !nextUrl || currentPage >= maxIterations;
             
-            // For other errors, stop pagination
-            hasMorePages = false;
-            break;
-          }
-
-          // Detect pagination type on first request if not specified
-          if (pageCount === 1) {
-            detectedPaginationType = detectPaginationType(response);
-            console.log('Detected pagination type:', detectedPaginationType);
-          }
-
-          // Process response data
-          let currentPageItems = [];
-          if (response.data) {
-            // Handle different response structures
-            if (Array.isArray(response.data)) {
-              currentPageItems = response.data;
-            } else if (response.data.data && Array.isArray(response.data.data)) {
-              currentPageItems = response.data.data;
-            } else if (response.data.items && Array.isArray(response.data.items)) {
-              currentPageItems = response.data.items;
-            } else if (response.data.orders && Array.isArray(response.data.orders)) {
-              currentPageItems = response.data.orders;
-            } else {
-              currentPageItems = [response.data];
+            if (isLastPage) {
+              // Save final execution log entry
+              await saveExecutionLog(
+                executionId,
+                { data: pageData, items: Array.isArray(pageData) ? pageData : [pageData] },
+                currentPage,
+                totalItemsProcessed,
+                nextUrl,
+                paginationType,
+                true
+              );
             }
-          }
 
-          // Log current page data count
-          console.log('\nPage Data Summary:', {
-            itemsInCurrentPage: currentPageItems.length,
-            totalItemsSoFar: totalItemsProcessed + currentPageItems.length,
-            currentPage: pageCount,
-            maxIterations,
-            responseData: response.data
-          });
-
-          // Store page data
-          const pageData = {
-            items: currentPageItems,
-            data: response.data, // Keep the original response data for reference
-            url: urlObj.toString(),
-            headers: response.headers
-          };
-          pages.push(pageData);
-          totalItemsProcessed += currentPageItems.length;
-
-          // Check for next page based on detected pagination type
-          if (detectedPaginationType === 'link') {
-            const nextUrl = extractNextUrl(response.headers.link);
-            if (!nextUrl) {
-              hasMorePages = false;
-              console.log('\nNo more pages (Link header):', `Page ${pageCount} is the last page`);
-            } else {
-              // For Shopify, we need to handle page_info parameter correctly
-              const nextUrlObj = new URL(nextUrl);
-              // Only remove status parameter, keep limit
-              nextUrlObj.searchParams.delete('status');
-              // Add limit parameter if it's not already present
-              if (!nextUrlObj.searchParams.has('limit') && queryParams.limit) {
-                nextUrlObj.searchParams.append('limit', queryParams.limit);
-              }
-              currentUrl = nextUrlObj.toString();
-              console.log('\nNext page URL:', currentUrl);
-            }
-          } else if (detectedPaginationType === 'bookmark') {
-            const bookmark = extractBookmark(response.data);
-            if (!bookmark) {
-              hasMorePages = false;
-              console.log('\nNo more pages (Bookmark):', `Page ${pageCount} is the last page`);
-            } else {
-              urlObj.searchParams.set('bookmark', bookmark);
-              currentUrl = urlObj.toString();
-              console.log('\nNext page bookmark:', bookmark);
-            }
-          } else if (detectedPaginationType === 'cursor') {
-            const cursor = extractCursor(response.data);
-            if (!cursor) {
-              hasMorePages = false;
-              console.log('\nNo more pages (Cursor):', `Page ${pageCount} is the last page`);
-            } else {
-              urlObj.searchParams.set('cursor', cursor);
-              currentUrl = urlObj.toString();
-              console.log('\nNext page cursor:', cursor);
-            }
-          } else if (detectedPaginationType === 'offset') {
-            const totalCount = response.data.total_count || response.data.total;
-            const currentOffset = parseInt(urlObj.searchParams.get('offset') || '0');
-            const limit = parseInt(urlObj.searchParams.get('limit') || '10');
+            currentPage++;
+          } catch (error) {
+            console.error(`[executeNamespacePaginatedRequest] Error processing page ${currentPage}:`, error);
             
-            if (currentOffset + limit >= totalCount) {
-              hasMorePages = false;
-              console.log('\nNo more pages (Offset):', `Page ${pageCount} is the last page`);
-            } else {
-              urlObj.searchParams.set('offset', (currentOffset + limit).toString());
-              currentUrl = urlObj.toString();
-              console.log('\nNext page offset:', currentOffset + limit);
-            }
-          } else {
-            hasMorePages = false;
-            console.log('\nNo pagination detected:', `Page ${pageCount} is the last page`);
+            // Save error execution log
+            await saveExecutionLog(
+              executionId,
+              { error: error.message },
+              currentPage,
+              totalItemsProcessed,
+              nextUrl,
+              paginationType,
+              true
+            );
+
+            throw error;
           }
-
-          console.log(`\n=== PAGE ${pageCount} SUMMARY ===`);
-          console.log({
-            status: response.status,
-            hasMorePages,
-            totalItemsProcessed,
-            currentPageItems: currentPageItems.length,
-            nextUrl: currentUrl,
-            paginationType: detectedPaginationType,
-            responseData: response.data
-          });
-
-          pageCount++;
         }
-
-        // Log final summary
-        console.log('\n=== PAGINATED REQUEST COMPLETED ===');
-        console.log({
-          totalPages: pageCount - 1,
-          totalItems: totalItemsProcessed,
-          executionId,
-          paginationType: detectedPaginationType || 'none',
-          finalUrl: currentUrl,
-          lastError: lastError
-        });
 
         return {
           statusCode: 200,
           body: {
-            status: 200,
-            metadata: {
-              totalPages: pageCount - 1,
-              totalItems: totalItemsProcessed,
-              executionId,
-              paginationType: detectedPaginationType || 'none',
-              lastError: lastError
-            },
-            pages: pages // Now returns array of page objects
+            executionId,
+            status: 'completed',
+            totalPages: currentPage - 1,
+            totalItemsProcessed,
+            paginationType
           }
         };
-
       } catch (error) {
-        console.error('\n=== PAGINATED REQUEST FAILED ===');
-        console.error({
-          message: error.message,
-          code: error.code,
-          stack: error.stack,
+        console.error('[executeNamespacePaginatedRequest] Error:', error);
+        return {
+          statusCode: 500,
+          body: { error: 'Failed to execute paginated request', details: error.message }
+        };
+      }
+    },
+
+    getExecutions: async (c, req, res) => {
+      console.log('[getExecutions] Request received');
+      
+      try {
+        const response = await dynamodbHandlers.getItems({
           request: {
-            url: currentUrl,
-            method,
-            headers
+            params: {
+              tableName: 'executions'
+            },
+            requestBody: {
+              TableName: 'executions',
+              // Get active executions from the last 24 hours
+              FilterExpression: "#data.#ts >= :dayAgo AND #data.#status[0] <> :completed",
+              ExpressionAttributeNames: {
+                "#data": "data",
+                "#ts": "timestamp",
+                "#status": "status"
+              },
+              ExpressionAttributeValues: {
+                ":dayAgo": new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString(),
+                ":completed": "completed"
+              }
+            }
           }
         });
 
-        // Handle specific error types
-        if (error.code === 'ECONNREFUSED') {
+        console.log('[getExecutions] Response:', {
+          statusCode: response.statusCode,
+          itemCount: response.body?.items?.length || 0
+        });
+
+        if (!response.body || !response.body.items) {
           return {
-            statusCode: 500,
-            body: {
-              error: 'Connection Failed',
-              details: 'Could not connect to the server. The service might be down or the URL might be incorrect.',
-              code: error.code
-            }
+            statusCode: 200,
+            body: []
           };
         }
 
         return {
+          statusCode: 200,
+          body: response.body.items.map(item => ({
+            'exec-id': item['exec-id'],
+            'child-exec-id': item['child-exec-id'],
+            data: item.data
+          }))
+        };
+      } catch (error) {
+        console.error('[getExecutions] Error:', error);
+        return {
           statusCode: 500,
-          body: { 
-            error: 'Failed to execute paginated request',
-            details: error.message,
-            code: error.code,
-            lastError: lastError
+          body: { error: 'Failed to get executions', details: error.message }
+        };
+      }
+    },
+
+    // Add this new handler in the handlers object
+    getExecutionById: async (c, req, res) => {
+      const executionId = c.request.params.executionId;
+      console.log('[getExecutionById] Request received for execution:', executionId);
+      
+      try {
+        const response = await dynamodbHandlers.getItems({
+          request: {
+            params: {
+              tableName: 'executions'
+            },
+            requestBody: {
+              TableName: 'executions',
+              FilterExpression: "#execId = :execId",
+              ExpressionAttributeNames: {
+                "#execId": "exec-id"
+              },
+              ExpressionAttributeValues: {
+                ":execId": executionId
+              }
+            }
           }
+        });
+
+        console.log('[getExecutionById] Response:', {
+          statusCode: response.statusCode,
+          itemCount: response.body?.items?.length || 0
+        });
+
+        if (!response.body || !response.body.items || response.body.items.length === 0) {
+          return {
+            statusCode: 404,
+            body: { error: 'Execution not found' }
+          };
+        }
+
+        // Check if all items in this execution are completed
+        const allCompleted = response.body.items.every(item => 
+          item.data.status.includes('completed') && item.data['is-last']
+        );
+
+        // If all items are completed, return 404 to stop polling
+        if (allCompleted) {
+          return {
+            statusCode: 404,
+            body: { error: 'Execution completed' }
+          };
+        }
+
+        return {
+          statusCode: 200,
+          body: response.body.items.map(item => ({
+            'exec-id': item['exec-id'],
+            'child-exec-id': item['child-exec-id'],
+            data: item.data
+          }))
+        };
+      } catch (error) {
+        console.error('[getExecutionById] Error:', error);
+        return {
+          statusCode: 500,
+          body: { error: 'Failed to get execution', details: error.message }
         };
       }
     }
@@ -1479,7 +1544,8 @@ const awsApi = new OpenAPIBackend({
     // New PK-only Operations
     getItemsByPk: dynamodbHandlers.getItemsByPk,
     updateItemsByPk: dynamodbHandlers.updateItemsByPk,
-    deleteItemsByPk: dynamodbHandlers.deleteItemsByPk
+    deleteItemsByPk: dynamodbHandlers.deleteItemsByPk,
+    getExecutions: dynamodbHandlers.getExecutions
   }
 });
 
@@ -1503,21 +1569,7 @@ const pinterestApi = new OpenAPIBackend({
 });
 
 // Initialize YAML OpenAPI backend
-const yamlApi = new OpenAPIBackend({
-  definition: './yaml-service.yaml',
-  quick: true,
-  handlers: {
-    validationFail: async (c, req, res) => ({
-      statusCode: 400,
-      error: c.validation.errors
-    }),
-    notFound: async (c, req, res) => ({
-      statusCode: 404,
-      error: 'Not Found'
-    }),
-    generateOpenApiSpec: yamlHandlers.generateOpenApiSpec
-  }
-});
+
 
 // Initialize AWS Messaging OpenAPI backend
 const awsMessagingApi = new OpenAPIBackend({
@@ -1552,7 +1604,6 @@ await Promise.all([
   mainApi.init(),
   awsApi.init(),
   pinterestApi.init(),
-  yamlApi.init(),
   awsMessagingApi.init()
 ]);
 
@@ -1642,9 +1693,6 @@ app.get('/pinterest-api-docs', (req, res) => {
   );
 });
 
-// Load YAML service OpenAPI specification
-const yamlOpenapiSpec = yaml.load(fs.readFileSync(path.join(__dirname, 'yaml-service.yaml'), 'utf8'));
-
 // Serve YAML service API docs
 app.use('/yaml-service-docs', swaggerUi.serve);
 app.get('/yaml-service-docs', (req, res) => {
@@ -1659,59 +1707,7 @@ app.get('/yaml-service-docs', (req, res) => {
 });
 
 // Serve YAML service OpenAPI specification
-app.get('/yaml-service-docs/swagger.json', (req, res) => {
-  res.json(yamlOpenapiSpec);
-});
 
-// Handle YAML service routes
-app.all('/api/yaml/*', async (req, res) => {
-  try {
-    // Remove the /api/yaml prefix from the path
-    const adjustedPath = req.path.replace('/api/yaml', '');
-    
-    const response = await yamlApi.handleRequest(
-      {
-        method: req.method,
-        path: adjustedPath || '/',
-        body: req.body,
-        query: req.query,
-        headers: req.headers
-      },
-      req,
-      res
-    );
-    res.status(response.statusCode).json(response.body);
-  } catch (error) {
-    console.error('[YAML Service] Error:', error.message);
-    res.status(500).json({
-      error: 'Failed to handle YAML service request',
-      message: error.message
-    });
-  }
-});
-
-// Add direct route for generate
-app.post('/generate', async (req, res) => {
-  try {
-    const response = await yamlApi.handleRequest(
-      {
-        method: 'POST',
-        path: '/generate',
-        body: req.body,
-        headers: req.headers
-      },
-      req,
-      res
-    );
-    res.status(response.statusCode).json(response.body);
-  } catch (error) {
-    console.error('[Generate YAML] Error:', error.message);
-    res.status(500).json({
-      error: 'Failed to generate YAML',
-      message: error.message
-    });
-  }
-});
 
 // Handle AWS DynamoDB routes
 app.all('/api/dynamodb/*', async (req, res, next) => {
@@ -1721,11 +1717,11 @@ app.all('/api/dynamodb/*', async (req, res, next) => {
   }
 
   try {
-    console.log('[DynamoDB Request]:', {
-      method: req.method,
-      path: req.path,
-      body: req.body
-    });
+    // console.log('[DynamoDB Request]:', {
+    //   method: req.method,
+    //   path: req.path,
+    //   body: req.body
+    // });
 
     // Adjust the path to remove the /api/dynamodb prefix
     const adjustedPath = req.path.replace('/api/dynamodb', '');
@@ -2245,13 +2241,20 @@ app.all('/api/aws-messaging/*', async (req, res) => {
   }
 });
 
+// Add this route after the existing routes
+app.get('/api/dynamodb/tables/executions/items/:executionId', async (req, res) => {
+  const result = await handlers.getExecutionById({
+    request: { params: { executionId: req.params.executionId } }
+  }, req, res);
+  res.status(result.statusCode).json(result.body);
+});
+
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, '0.0.0.0', () => {
   console.log(`Server listening on port ${PORT}`);
   console.log(`Main API documentation available at http://localhost:${PORT}/api-docs`);
   console.log(`Pinterest API documentation available at http://localhost:${PORT}/pinterest-api-docs`);
   console.log(`AWS DynamoDB service available at http://localhost:${PORT}/api/dynamodb`);
-  console.log(`YAML Service documentation available at http://localhost:${PORT}/yaml-service-docs`);
   console.log(`AWS Messaging Service documentation available at http://localhost:${PORT}/aws-messaging-docs`);
 });
 

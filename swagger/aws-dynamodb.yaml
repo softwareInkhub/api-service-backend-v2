@@ -20,21 +20,14 @@ components:
 
     TableItem:
       type: object
-      required: ["id"]
-      properties:
-        id:
-          type: string
-          example: "123"
-        test:
-          type: string
-          example: "test value"
-        data:
-          type: object
-          additionalProperties: true
-          example: {
-            "field1": "value1",
-            "field2": "value2"
-          }
+      additionalProperties: true
+      example: {
+        "id": "123",                    # Example for table with just primary key
+        "data": {
+          "field1": "value1",
+          "field2": "value2"
+        }
+      }
 
     CreateTableRequest:
       type: object
