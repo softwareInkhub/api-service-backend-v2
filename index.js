@@ -14,16 +14,13 @@ import { handlers as dynamodbHandlers } from './lib/dynamodb-handlers.js';
 import dotenv from 'dotenv';
 import { handlers as yamlHandlers } from './yaml-handlers.js';
 import { handlers as awsMessagingHandlers } from './aws-messaging-handlers.js';
+import { saveSingleExecutionLog, savePaginatedExecutionLogs } from './executionHandler.js';
 
 dotenv.config();  
 
 const app = express();
 app.use(express.json());
-app.use(cors({
-  origin: 'http://localhost:3000',
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Accept']
-}));
+app.use(cors());
 // File storage configuration
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -1043,6 +1040,7 @@ const mainApi = new OpenAPIBackend({
       });
 
       const { method, url, queryParams = {}, headers = {}, body = null } = c.request.requestBody;
+      const execId = uuidv4();
       
       try {
         // Build URL with query parameters
@@ -1067,6 +1065,17 @@ const mainApi = new OpenAPIBackend({
         console.log('Response received:', {
           status: response.status,
           statusText: response.statusText
+        });
+
+        // Save execution log
+        await saveSingleExecutionLog({
+          execId,
+          method,
+          url: urlObj.toString(),
+          queryParams,
+          headers,
+          responseStatus: response.status,
+          responseData: response.data
         });
 
         // Handle authentication errors specifically
@@ -1148,7 +1157,9 @@ const mainApi = new OpenAPIBackend({
         url: c.request.requestBody.url,
         maxIterations: c.request.requestBody.maxIterations || 10,
         queryParams: c.request.requestBody.queryParams,
-        headers: c.request.requestBody.headers
+        headers: c.request.requestBody.headers,
+        tableName: c.request.requestBody.tableName,
+        saveData: c.request.requestBody.saveData
       });
 
       const { 
@@ -1157,261 +1168,415 @@ const mainApi = new OpenAPIBackend({
         maxIterations = 10,
         queryParams = {}, 
         headers = {}, 
-        body = null
+        body = null,
+        tableName,
+        saveData
       } = c.request.requestBody;
 
       let currentUrl = url;
       let lastError = null;
+      const execId = uuidv4();
+      let executionLogs;
 
       try {
-        const executionId = uuidv4();
-        const pages = []; // Array to store page data
-        let pageCount = 1;
-        let hasMorePages = true;
-        let detectedPaginationType = null;
-        let totalItemsProcessed = 0;
-
-        // Function to detect pagination type from response
-        const detectPaginationType = (response) => {
-          // Check for Link header pagination (Shopify style)
-          if (response.headers.link && response.headers.link.includes('rel="next"')) {
-            return 'link';
-          }
-          
-          // Check for bookmark pagination (Pinterest style)
-          if (response.data && response.data.bookmark) {
-            return 'bookmark';
-          }
-
-          // Check for cursor-based pagination
-          if (response.data && (response.data.next_cursor || response.data.cursor)) {
-            return 'cursor';
-          }
-
-          // Check for offset/limit pagination
-          if (response.data && (response.data.total_count !== undefined || response.data.total !== undefined)) {
-            return 'offset';
-          }
-
-          return null;
-        };
-
-        // Extract next URL from Link header (Shopify)
-        const extractNextUrl = (linkHeader) => {
-          if (!linkHeader) return null;
-          const matches = linkHeader.match(/<([^>]+)>;\s*rel="next"/);
-          return matches ? matches[1] : null;
-        };
-
-        // Extract bookmark from response (Pinterest)
-        const extractBookmark = (responseData) => {
-          if (!responseData) return null;
-          return responseData.bookmark || null;
-        };
-
-        // Extract cursor from response
-        const extractCursor = (responseData) => {
-          if (!responseData) return null;
-          return responseData.next_cursor || responseData.cursor || null;
-        };
-
-        while (hasMorePages && pageCount <= maxIterations) {
-          console.log(`\n=== PAGE ${pageCount} START ===`);
-          
-          // Build URL with query parameters
-          const urlObj = new URL(currentUrl);
-          
-          // Only add query parameters if they're not already in the URL and it's the first page
-          if (pageCount === 1) {
-            Object.entries(queryParams).forEach(([key, value]) => {
-              if (value && !urlObj.searchParams.has(key)) {
-                urlObj.searchParams.append(key, value);
-              }
-            });
-          }
-
-          // Make request
-          console.log('Making request to:', urlObj.toString());
-          const response = await axios({
-            method: method.toUpperCase(),
-            url: urlObj.toString(),
-            headers: headers,
-            data: !['GET', 'HEAD'].includes(method.toUpperCase()) ? body : undefined,
-            validateStatus: () => true
-          });
-
-          console.log('Response received:', {
-            status: response.status,
-            statusText: response.statusText,
-            headers: response.headers,
-            dataLength: response.data ? JSON.stringify(response.data).length : 0,
-            data: response.data
-          });
-
-          // Handle API errors
-          if (response.status >= 400) {
-            lastError = {
-              status: response.status,
-              statusText: response.statusText,
-              data: response.data,
-              url: urlObj.toString()
-            };
-            console.error(`\nAPI Error on page ${pageCount}:`, lastError);
-            
-            // For Shopify API, check if it's a rate limit error
-            if (response.status === 429 || 
-                (response.data && 
-                 response.data.errors && 
-                 (Array.isArray(response.data.errors) ? 
-                   response.data.errors.some(err => err.includes('rate limit')) :
-                   response.data.errors.toString().includes('rate limit')))) {
-              console.log('Rate limit detected, waiting before retry...');
-              await new Promise(resolve => setTimeout(resolve, 5000)); // Wait 5 seconds
-              continue; // Retry the same page
-            }
-            
-            // For other errors, stop pagination
-            hasMorePages = false;
-            break;
-          }
-
-          // Detect pagination type on first request if not specified
-          if (pageCount === 1) {
-            detectedPaginationType = detectPaginationType(response);
-            console.log('Detected pagination type:', detectedPaginationType);
-          }
-
-          // Process response data
-          let currentPageItems = [];
-          if (response.data) {
-            // Handle different response structures
-            if (Array.isArray(response.data)) {
-              currentPageItems = response.data;
-            } else if (response.data.data && Array.isArray(response.data.data)) {
-              currentPageItems = response.data.data;
-            } else if (response.data.items && Array.isArray(response.data.items)) {
-              currentPageItems = response.data.items;
-            } else if (response.data.orders && Array.isArray(response.data.orders)) {
-              currentPageItems = response.data.orders;
-            } else {
-              currentPageItems = [response.data];
-            }
-          }
-
-          // Log current page data count
-          console.log('\nPage Data Summary:', {
-            itemsInCurrentPage: currentPageItems.length,
-            totalItemsSoFar: totalItemsProcessed + currentPageItems.length,
-            currentPage: pageCount,
-            maxIterations,
-            responseData: response.data
-          });
-
-          // Store page data
-          const pageData = {
-            items: currentPageItems,
-            data: response.data, // Keep the original response data for reference
-            url: urlObj.toString(),
-            headers: response.headers
-          };
-          pages.push(pageData);
-          totalItemsProcessed += currentPageItems.length;
-
-          // Check for next page based on detected pagination type
-          if (detectedPaginationType === 'link') {
-            const nextUrl = extractNextUrl(response.headers.link);
-            if (!nextUrl) {
-              hasMorePages = false;
-              console.log('\nNo more pages (Link header):', `Page ${pageCount} is the last page`);
-            } else {
-              // For Shopify, we need to handle page_info parameter correctly
-              const nextUrlObj = new URL(nextUrl);
-              // Only remove status parameter, keep limit
-              nextUrlObj.searchParams.delete('status');
-              // Add limit parameter if it's not already present
-              if (!nextUrlObj.searchParams.has('limit') && queryParams.limit) {
-                nextUrlObj.searchParams.append('limit', queryParams.limit);
-              }
-              currentUrl = nextUrlObj.toString();
-              console.log('\nNext page URL:', currentUrl);
-            }
-          } else if (detectedPaginationType === 'bookmark') {
-            const bookmark = extractBookmark(response.data);
-            if (!bookmark) {
-              hasMorePages = false;
-              console.log('\nNo more pages (Bookmark):', `Page ${pageCount} is the last page`);
-            } else {
-              urlObj.searchParams.set('bookmark', bookmark);
-              currentUrl = urlObj.toString();
-              console.log('\nNext page bookmark:', bookmark);
-            }
-          } else if (detectedPaginationType === 'cursor') {
-            const cursor = extractCursor(response.data);
-            if (!cursor) {
-              hasMorePages = false;
-              console.log('\nNo more pages (Cursor):', `Page ${pageCount} is the last page`);
-            } else {
-              urlObj.searchParams.set('cursor', cursor);
-              currentUrl = urlObj.toString();
-              console.log('\nNext page cursor:', cursor);
-            }
-          } else if (detectedPaginationType === 'offset') {
-            const totalCount = response.data.total_count || response.data.total;
-            const currentOffset = parseInt(urlObj.searchParams.get('offset') || '0');
-            const limit = parseInt(urlObj.searchParams.get('limit') || '10');
-            
-            if (currentOffset + limit >= totalCount) {
-              hasMorePages = false;
-              console.log('\nNo more pages (Offset):', `Page ${pageCount} is the last page`);
-            } else {
-              urlObj.searchParams.set('offset', (currentOffset + limit).toString());
-              currentUrl = urlObj.toString();
-              console.log('\nNext page offset:', currentOffset + limit);
-            }
-          } else {
-            hasMorePages = false;
-            console.log('\nNo pagination detected:', `Page ${pageCount} is the last page`);
-          }
-
-          console.log(`\n=== PAGE ${pageCount} SUMMARY ===`);
-          console.log({
-            status: response.status,
-            hasMorePages,
-            totalItemsProcessed,
-            currentPageItems: currentPageItems.length,
-            nextUrl: currentUrl,
-            paginationType: detectedPaginationType,
-            responseData: response.data
-          });
-
-          pageCount++;
-        }
-
-        // Log final summary
-        console.log('\n=== PAGINATED REQUEST COMPLETED ===');
-        console.log({
-          totalPages: pageCount - 1,
-          totalItems: totalItemsProcessed,
-          executionId,
-          paginationType: detectedPaginationType || 'none',
-          finalUrl: currentUrl,
-          lastError: lastError
+        // Initialize execution logs
+        executionLogs = await savePaginatedExecutionLogs({
+          execId,
+          method,
+          url,
+          queryParams,
+          headers,
+          maxIterations,
+          tableName,
+          saveData
         });
 
-        return {
+        if (!executionLogs) {
+          throw new Error('Failed to initialize execution logs');
+        }
+
+        // Return immediately with execution ID and initial status
+        const initialResponse = {
           statusCode: 200,
           body: {
             status: 200,
-            metadata: {
-              totalPages: pageCount - 1,
-              totalItems: totalItemsProcessed,
-              executionId,
-              paginationType: detectedPaginationType || 'none',
-              lastError: lastError
-            },
-            pages: pages // Now returns array of page objects
+            data: {
+              executionId: execId,
+              status: 'initialized',
+              method,
+              url,
+              maxIterations,
+              timestamp: new Date().toISOString()
+            }
           }
         };
+
+        // Start processing in the background
+        (async () => {
+          try {
+            const pages = [];
+            let pageCount = 1;
+            let hasMorePages = true;
+            let detectedPaginationType = null;
+            let totalItemsProcessed = 0;
+
+            // Update parent execution status to inProgress
+            await executionLogs.updateParentStatus('inProgress', false);
+
+            // Function to save items to DynamoDB
+            const saveItemsToDynamoDB = async (items, pageData) => {
+              if (!saveData || !tableName || items.length === 0) return;
+
+              console.log(`\nSaving ${items.length} items to DynamoDB table: ${tableName}`);
+              
+              const timestamp = new Date().toISOString();
+              const baseRequestDetails = {
+                method,
+                url: pageData.url,
+                queryParams,
+                headers,
+                body
+              };
+
+              const BATCH_SIZE = 5;
+              const batches = [];
+              
+              for (let i = 0; i < items.length; i += BATCH_SIZE) {
+                batches.push(items.slice(i, i + BATCH_SIZE));
+              }
+
+              for (let batchIndex = 0; batchIndex < batches.length; batchIndex++) {
+                const batch = batches[batchIndex];
+                console.log(`Processing batch ${batchIndex + 1}/${batches.length} (${batch.length} items)`);
+
+                const savePromises = batch.map(async (item, index) => {
+                  // Create a clean copy of the item
+                  const cleanedItem = { ...item };
+                  
+                  // Ensure id is a string
+                  if (typeof cleanedItem.id === 'number') {
+                    cleanedItem.id = cleanedItem.id.toString();
+                  }
+
+                  // Remove bookmark and url fields from the item
+                  const { bookmark, url, ...itemWithoutBookmark } = cleanedItem;
+
+                  // Keep only essential fields and primitive values
+                  const simplifiedItem = Object.entries(itemWithoutBookmark).reduce((acc, [key, value]) => {
+                    if (typeof value === 'string' || 
+                        typeof value === 'number' || 
+                        typeof value === 'boolean' ||
+                        value === null ||
+                        Array.isArray(value) ||
+                        (typeof value === 'object' && value !== null)) {
+                      acc[key] = value;
+                    }
+                    return acc;
+                  }, {});
+                  
+                  const itemData = {
+                    id: cleanedItem.id || `item_${timestamp}_${batchIndex}_${index}`,
+                    Item: simplifiedItem,
+                    timestamp,
+                    _metadata: {
+                      requestDetails: baseRequestDetails,
+                      status: pageData.status,
+                      itemIndex: batchIndex * BATCH_SIZE + index,
+                      totalItems: items.length,
+                      originalId: item.id
+                    }
+                  };
+
+                  try {
+                    const dbResponse = await dynamodbHandlers.createItem({
+                      request: {
+                        params: {
+                          tableName
+                        },
+                        requestBody: itemData
+                      }
+                    });
+
+                    if (!dbResponse.ok) {
+                      console.error('Failed to save item:', dbResponse);
+                      return null;
+                    }
+
+                    console.log(`Successfully saved item ${batchIndex * BATCH_SIZE + index + 1}/${items.length}`);
+                    return index;
+                  } catch (error) {
+                    console.error(`Error saving item ${batchIndex * BATCH_SIZE + index + 1}:`, error);
+                    return null;
+                  }
+                });
+
+                await Promise.all(savePromises);
+                console.log(`Completed batch ${batchIndex + 1}/${batches.length}`);
+              }
+
+              console.log(`Completed saving ${items.length} items to DynamoDB`);
+            };
+
+            // Function to detect pagination type from response
+            const detectPaginationType = (response) => {
+              // Check for Link header pagination (Shopify style)
+              if (response.headers.link && response.headers.link.includes('rel="next"')) {
+                return 'link';
+              }
+              
+              // Check for bookmark pagination (Pinterest style)
+              if (response.data && response.data.bookmark) {
+                return 'bookmark';
+              }
+
+              // Check for cursor-based pagination
+              if (response.data && (response.data.next_cursor || response.data.cursor)) {
+                return 'cursor';
+              }
+
+              // Check for offset/limit pagination
+              if (response.data && (response.data.total_count !== undefined || response.data.total !== undefined)) {
+                return 'offset';
+              }
+
+              return null;
+            };
+
+            // Extract next URL from Link header (Shopify)
+            const extractNextUrl = (linkHeader) => {
+              if (!linkHeader) return null;
+              const matches = linkHeader.match(/<([^>]+)>;\s*rel="next"/);
+              return matches ? matches[1] : null;
+            };
+
+            // Extract bookmark from response (Pinterest)
+            const extractBookmark = (responseData) => {
+              if (!responseData) return null;
+              return responseData.bookmark || null;
+            };
+
+            // Extract cursor from response
+            const extractCursor = (responseData) => {
+              if (!responseData) return null;
+              return responseData.next_cursor || responseData.cursor || null;
+            };
+
+            while (hasMorePages && pageCount <= maxIterations) {
+              console.log(`\n=== PAGE ${pageCount} START ===`);
+              
+              // Build URL with query parameters
+              const urlObj = new URL(currentUrl);
+              
+              // Only add query parameters if they're not already in the URL and it's the first page
+              if (pageCount === 1) {
+                Object.entries(queryParams).forEach(([key, value]) => {
+                  if (value && !urlObj.searchParams.has(key)) {
+                    urlObj.searchParams.append(key, value);
+                  }
+                });
+              }
+
+              // Make request
+              console.log('Making request to:', urlObj.toString());
+              const response = await axios({
+                method: method.toUpperCase(),
+                url: urlObj.toString(),
+                headers: headers,
+                data: !['GET', 'HEAD'].includes(method.toUpperCase()) ? body : undefined,
+                validateStatus: () => true
+              });
+
+              console.log('Response received:', {
+                status: response.status,
+                statusText: response.statusText,
+                headers: response.headers,
+                dataLength: response.data ? JSON.stringify(response.data).length : 0,
+                data: response.data
+              });
+
+              // Handle API errors
+              if (response.status >= 400) {
+                lastError = {
+                  status: response.status,
+                  statusText: response.statusText,
+                  data: response.data,
+                  url: urlObj.toString()
+                };
+                console.error(`\nAPI Error on page ${pageCount}:`, lastError);
+                
+                // For Shopify API, check if it's a rate limit error
+                if (response.status === 429 || 
+                    (response.data && 
+                     response.data.errors && 
+                     (Array.isArray(response.data.errors) ? 
+                       response.data.errors.some(err => err.includes('rate limit')) :
+                       response.data.errors.toString().includes('rate limit')))) {
+                  console.log('Rate limit detected, waiting before retry...');
+                  await new Promise(resolve => setTimeout(resolve, 5000)); // Wait 5 seconds
+                  continue; // Retry the same page
+                }
+                
+                // For other errors, stop pagination
+                hasMorePages = false;
+                break;
+              }
+
+              // Detect pagination type on first request if not specified
+              if (pageCount === 1) {
+                detectedPaginationType = detectPaginationType(response);
+                console.log('Detected pagination type:', detectedPaginationType);
+              }
+
+              // Process response data
+              let currentPageItems = [];
+              if (response.data) {
+                // Handle different response structures
+                if (Array.isArray(response.data)) {
+                  currentPageItems = response.data;
+                } else if (response.data.data && Array.isArray(response.data.data)) {
+                  currentPageItems = response.data.data;
+                } else if (response.data.items && Array.isArray(response.data.items)) {
+                  currentPageItems = response.data.items;
+                } else if (response.data.orders && Array.isArray(response.data.orders)) {
+                  currentPageItems = response.data.orders;
+                } else {
+                  currentPageItems = [response.data];
+                }
+              }
+
+              // Log current page data count
+              console.log('\nPage Data Summary:', {
+                itemsInCurrentPage: currentPageItems.length,
+                totalItemsSoFar: totalItemsProcessed + currentPageItems.length,
+                currentPage: pageCount,
+                maxIterations,
+                responseData: response.data
+              });
+
+              // Store page data
+              const pageData = {
+                items: currentPageItems,
+                data: response.data, // Keep the original response data for reference
+                url: urlObj.toString(),
+                headers: response.headers
+              };
+              pages.push(pageData);
+              totalItemsProcessed += currentPageItems.length;
+
+              // After processing each page's items
+              if (currentPageItems.length > 0) {
+                // Save items to DynamoDB if saveData is true
+                await saveItemsToDynamoDB(currentPageItems, {
+                  url: urlObj.toString(),
+                  status: response.status,
+                  headers: response.headers
+                });
+
+                // Save child execution log
+                await executionLogs.saveChildExecution({
+                  pageNumber: pageCount,
+                  totalItemsProcessed,
+                  itemsInCurrentPage: currentPageItems.length,
+                  url: urlObj.toString(),
+                  status: response.status,
+                  paginationType: detectedPaginationType || 'none',
+                  isLast: !hasMorePages || pageCount === maxIterations
+                });
+              }
+
+              // Check for next page based on detected pagination type
+              if (detectedPaginationType === 'link') {
+                const nextUrl = extractNextUrl(response.headers.link);
+                if (!nextUrl) {
+                  hasMorePages = false;
+                  console.log('\nNo more pages (Link header):', `Page ${pageCount} is the last page`);
+                } else {
+                  // For Shopify, we need to handle page_info parameter correctly
+                  const nextUrlObj = new URL(nextUrl);
+                  // Only remove status parameter, keep limit
+                  nextUrlObj.searchParams.delete('status');
+                  // Add limit parameter if it's not already present
+                  if (!nextUrlObj.searchParams.has('limit') && queryParams.limit) {
+                    nextUrlObj.searchParams.append('limit', queryParams.limit);
+                  }
+                  currentUrl = nextUrlObj.toString();
+                  console.log('\nNext page URL:', currentUrl);
+                }
+              } else if (detectedPaginationType === 'bookmark') {
+                const bookmark = extractBookmark(response.data);
+                if (!bookmark) {
+                  hasMorePages = false;
+                  console.log('\nNo more pages (Bookmark):', `Page ${pageCount} is the last page`);
+                } else {
+                  urlObj.searchParams.set('bookmark', bookmark);
+                  currentUrl = urlObj.toString();
+                  console.log('\nNext page bookmark:', bookmark);
+                }
+              } else if (detectedPaginationType === 'cursor') {
+                const cursor = extractCursor(response.data);
+                if (!cursor) {
+                  hasMorePages = false;
+                  console.log('\nNo more pages (Cursor):', `Page ${pageCount} is the last page`);
+                } else {
+                  urlObj.searchParams.set('cursor', cursor);
+                  currentUrl = urlObj.toString();
+                  console.log('\nNext page cursor:', cursor);
+                }
+              } else if (detectedPaginationType === 'offset') {
+                const totalCount = response.data.total_count || response.data.total;
+                const currentOffset = parseInt(urlObj.searchParams.get('offset') || '0');
+                const limit = parseInt(urlObj.searchParams.get('limit') || '10');
+                
+                if (currentOffset + limit >= totalCount) {
+                  hasMorePages = false;
+                  console.log('\nNo more pages (Offset):', `Page ${pageCount} is the last page`);
+                } else {
+                  urlObj.searchParams.set('offset', (currentOffset + limit).toString());
+                  currentUrl = urlObj.toString();
+                  console.log('\nNext page offset:', currentOffset + limit);
+                }
+              } else {
+                hasMorePages = false;
+                console.log('\nNo pagination detected:', `Page ${pageCount} is the last page`);
+              }
+
+              console.log(`\n=== PAGE ${pageCount} SUMMARY ===`);
+              console.log({
+                status: response.status,
+                hasMorePages,
+                totalItemsProcessed,
+                currentPageItems: currentPageItems.length,
+                nextUrl: currentUrl,
+                paginationType: detectedPaginationType,
+                responseData: response.data
+              });
+
+              pageCount++;
+            }
+
+            // Update parent execution status to completed
+            await executionLogs.updateParentStatus('completed', true);
+
+            // Log final summary
+            console.log('\n=== PAGINATED REQUEST COMPLETED ===');
+            console.log({
+              totalPages: pageCount - 1,
+              totalItems: totalItemsProcessed,
+              executionId: execId,
+              paginationType: detectedPaginationType || 'none',
+              finalUrl: currentUrl,
+              lastError: lastError
+            });
+
+          } catch (error) {
+            console.error('Background processing error:', error);
+            if (executionLogs) {
+              await executionLogs.updateParentStatus('error', true);
+            }
+          }
+        })();
+
+        return initialResponse;
 
       } catch (error) {
         console.error('\n=== PAGINATED REQUEST FAILED ===');
@@ -1425,18 +1590,6 @@ const mainApi = new OpenAPIBackend({
             headers
           }
         });
-
-        // Handle specific error types
-        if (error.code === 'ECONNREFUSED') {
-          return {
-            statusCode: 500,
-            body: {
-              error: 'Connection Failed',
-              details: 'Could not connect to the server. The service might be down or the URL might be incorrect.',
-              code: error.code
-            }
-          };
-        }
 
         return {
           statusCode: 500,
